@@ -23,16 +23,15 @@ import pickle
 from contextlib import nullcontext
 from omegaconf import OmegaConf
 import argparse
-from pathlib import Path
+
 
 import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
-
-base_config_path = Path(__file__).resolve().parent / "config" / "base.yaml"
+from .model import GPTConfig, GPT
+from .utils import BASE_PATH
 
 
 def train(conf):
@@ -60,9 +59,9 @@ def train(conf):
         ddp_world_size = 1
     tokens_per_iter = conf.gradient_accumulation_steps * ddp_world_size * conf.batch_size * conf.block_size
     print(f"tokens per iteration will be: {tokens_per_iter:,}")
-
+    model_dir = BASE_PATH / 'models' / conf.out_dir
     if master_process:
-        os.makedirs(conf.out_dir, exist_ok=True)
+        os.makedirs(model_dir, exist_ok=True)
     torch.manual_seed(1337 + seed_offset)
     torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
     torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
@@ -72,14 +71,15 @@ def train(conf):
     ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
     # poor man's data loader
-    data_dir = os.path.join('data', conf.dataset)
+    data_dir = BASE_PATH / "data" / conf.dataset
+
     def get_batch(split):
         # We recreate np.memmap every batch to avoid a memory leak, as per
         # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
         if split == 'train':
-            data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+            data = np.memmap(data_dir / 'train.bin', dtype=np.uint16, mode='r')
         else:
-            data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+            data = np.memmap(data_dir / 'val.bin', dtype=np.uint16, mode='r')
         ix = torch.randint(len(data) - conf.block_size, (conf.batch_size,))
         x = torch.stack([torch.from_numpy((data[i:i+conf.block_size]).astype(np.int64)) for i in ix])
         y = torch.stack([torch.from_numpy((data[i+1:i+1+conf.block_size]).astype(np.int64)) for i in ix])
@@ -95,7 +95,7 @@ def train(conf):
     best_val_loss = 1e9
 
     # attempt to derive vocab_size from the dataset
-    meta_path = os.path.join(data_dir, 'meta.pkl')
+    meta_path = data_dir / 'meta.pkl'
     meta_vocab_size = None
     if os.path.exists(meta_path):
         with open(meta_path, 'rb') as f:
@@ -120,7 +120,7 @@ def train(conf):
     elif conf.init_from == 'resume':
         print(f"Resuming training from {conf.out_dir}")
         # resume training from a checkpoint.
-        ckpt_path = os.path.join(conf.out_dir, 'ckpt.pt')
+        ckpt_path = model_dir / 'ckpt.pt'
         checkpoint = torch.load(ckpt_path, map_location=conf.device)
         checkpoint_model_args = checkpoint['model_args']
         # force these config attributes to be equal otherwise we can't even resume training
@@ -246,7 +246,7 @@ def train(conf):
                         'config': conf,
                     }
                     print(f"saving checkpoint to {conf.out_dir}")
-                    torch.save(checkpoint, os.path.join(conf.out_dir, 'ckpt.pt'))
+                    torch.save(checkpoint, model_dir / 'ckpt.pt')
         if iter_num == 0 and conf.eval_only:
             print('BREAKING BECAUSE EVAL ONLY')
             break
@@ -301,6 +301,22 @@ def train(conf):
         destroy_process_group()
 
 
+def make_train_config(config_name=None, overrides=None):
+    base_cfg = OmegaConf.load(BASE_PATH / 'config' / 'base.yaml')
+
+    # 2. Load and merge an optional config file specified via command line
+    if config_name:
+        override_cfg = OmegaConf.load(BASE_PATH / 'config' / config_name)
+        cfg = OmegaConf.merge(base_cfg, override_cfg)
+    else:
+        cfg = base_cfg
+
+    # 3. Process additional command-line arguments as overrides
+    if overrides:
+        cfg = OmegaConf.merge(cfg, overrides)
+    return cfg
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Load configurations with OmegaConf")
     parser.add_argument("--config_file", type=str, help="Path to an additional config file to override the base config")
@@ -308,21 +324,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    # 1. Load the base configuration
-    base_cfg = OmegaConf.load(base_config_path)
-
-    # 2. Load and merge an optional config file specified via command line
-    if args.config_file:
-        override_cfg = OmegaConf.load(args.config_file)
-        cfg = OmegaConf.merge(base_cfg, override_cfg)
-    else:
-        cfg = base_cfg
-
-    # 3. Process additional command-line arguments as overrides
-    if args.overrides:
-        cli_overrides = OmegaConf.from_dotlist(args.overrides)
-        cfg = OmegaConf.merge(cfg, cli_overrides)
-
+    cfg = make_train_config(args.config_file, OmegaConf.from_dotlist(args.overrides))
     # Now `cfg` holds the final configuration with all overrides applied
     print(OmegaConf.to_yaml(cfg))  # Print the final config for demonstration
     train(cfg)

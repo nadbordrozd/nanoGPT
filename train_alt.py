@@ -19,6 +19,7 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 import os
 import time
 import math
+import json
 from tqdm import tqdm
 from contextlib import nullcontext
 from omegaconf import OmegaConf
@@ -161,7 +162,7 @@ def train(model, dataset, train_cfg, env_cfg):
                 with ctx:
                     logits, loss = model(X, Y)
                 losses[k] = loss.item()
-            out[split] = losses.mean()
+            out[split] = float(losses.mean())
         model.train()
         return out
 
@@ -271,6 +272,8 @@ def train(model, dataset, train_cfg, env_cfg):
             logger.info(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
         local_iter_num += 1
 
+    with open(model_dir / 'history.json', 'w') as f:
+        json.dump(history, f)
 
     if ddp:
         destroy_process_group()

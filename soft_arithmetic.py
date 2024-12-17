@@ -2,7 +2,10 @@ import torch
 import torch.nn.functional as F
 import unittest
 
-def build_addition_matrix():
+
+M_dict = {}
+
+def build_addition_matrix(device):
     """
     Build a 200x20 matrix M that maps one-hot input (x,y,c_in) to one-hot output (d_out,c_out).
 
@@ -15,7 +18,7 @@ def build_addition_matrix():
     c_out = sum // 10 in [0..1].
     index_out = c_out*10 + d_out, total 20 combinations.
     """
-    M = torch.zeros(200, 20, dtype=torch.float32)
+    M = torch.zeros(200, 20, dtype=torch.float32, device=device)
     for x in range(10):
         for y in range(10):
             for c_in in range(2):
@@ -27,8 +30,11 @@ def build_addition_matrix():
                 M[idx_in, idx_out] = 1.0
     return M
 
-# Precompute the matrix M globally
-M = build_addition_matrix()
+def get_M_for_device(device):
+    if device not in M_dict:
+        M_dict[device] = build_addition_matrix(device)    
+    return M_dict[device]
+
 
 def single_digit_add_batch(M, x_dist, y_dist, c_in_dist):
     """
@@ -77,6 +83,7 @@ def differentiable_addition(x_vec, y_vec, n=3):
     x_vec, y_vec: (batch, 10*n) one-hot for each digit in the batch.
     Returns: (batch, (n+1)*10)
     """
+    M = get_M_for_device(x_vec.device)
     batch = x_vec.shape[0]
     # Reshape to (batch, n, 10)
     x_digits = x_vec.view(batch, n, 10)

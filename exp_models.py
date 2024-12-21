@@ -54,6 +54,7 @@ class FBlock_V1(nn.Module):
         x = torch.cat([x, sum_embed.unsqueeze(1)], dim=1)
         return x
 
+
 class FBlock_V2(nn.Module):
     """A Block variant that applies F to the representations of two tokens."""
     def __init__(self, config):
@@ -113,6 +114,54 @@ class GPT_V1(GPT):
      
         self.transformer.h[config.modified_layer] = FBlock_V1(config)
 
+    def forward(self, idx, targets=None):
+        """
+        Same logic as GPT.forward, but we slice off any extra tokens
+        introduced by the last block before computing loss.
+        """
+        device = idx.device
+        b, t = idx.size()
+        assert t <= self.config.block_size, (
+            f"Cannot forward sequence of length {t}, "
+            f"block size is only {self.config.block_size}"
+        )
+        
+        # Positions 0..t-1
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        
+        # Token + position embeddings
+        tok_emb = self.transformer.wte(idx)  # (B, T, n_embd)
+        pos_emb = self.transformer.wpe(pos)  # (T, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        
+        # Pass through the Transformer blocks
+        for block in self.transformer.h:
+            x = block(x)
+        # Now x might have shape (B, T, C) or (B, T+1, C), depending on FBlock concatenation
+        
+        # In case FBlock appended tokens, let's slice back to T:
+        # (only do this if x is longer than T)
+        final_seq_len = x.shape[1]
+        if final_seq_len > t:
+            x = x[:, :t, :]  # drop extra tokens so shape is (B, T, C)
+        
+        # Final layer norm
+        x = self.transformer.ln_f(x)  # (B, T, C)
+        
+        # If we have targets, compute cross-entropy over all T tokens
+        if targets is not None:
+            logits = self.lm_head(x)  # (B, T, vocab_size)
+            loss = Fnn.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1
+            )
+        else:
+            # In inference mode, we only need the logits at the last position
+            logits = self.lm_head(x[:, [-1], :])  # shape (B, 1, vocab_size)
+            loss = None
+        
+        return logits, loss
 
 class GPT_V2(GPT):
     """
